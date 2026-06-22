@@ -17,20 +17,43 @@ WEB_SEARCH_MODEL = "gpt-5.4-nano"    # 웹검색 모드에서 사용할 모델
 # 문서가 너무 길 경우 앞부분 일부만 사용 (최대 글자 수 제한)
 MAX_DOC_CHARS = 6000
 
+# 보고서가 들어 있는 데이터 폴더 (분야별 하위 폴더)
+DATA_DIR = r"C:\Users\jihyun\Desktop\KEITI_AD\ecolab\데이터"
+CATEGORIES = {
+    "국가별 보고서": "country_report",
+    "정책규제 보고서": "policy_report",
+}
+
+# 문서에서 답을 찾지 못했을 때 사용할 고정 안내 문구
+NOT_FOUND_MESSAGE = "업로드된 문서에서 확인하기 어렵습니다"
+
 # 한글 문서 추출 실패 시 공통 안내 문구
 HWP_FAIL_MESSAGE = (
     "해당 한글 문서는 텍스트 추출이 어렵습니다. "
     "PDF 또는 DOCX로 변환 후 다시 업로드해주세요."
 )
 
-st.title("나의 AI 챗봇")
+st.title("환경 정책 문서 Q&A 도우미")
 
 # API Key 확인
-api_key = os.getenv("OPENAI_API_KEY")
+# Streamlit Cloud 배포 환경에서는 st.secrets를, 로컬에서는 .env(os.getenv)를 사용한다.
+# st.secrets는 secrets.toml이 없으면 예외를 던지므로 try로 감싼다.
+def get_api_key():
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+    return os.getenv("OPENAI_API_KEY")
+
+
+api_key = get_api_key()
 if not api_key:
     st.error(
         "OPENAI_API_KEY를 찾을 수 없습니다. "
-        "프로젝트 폴더의 .env 파일에 OPENAI_API_KEY를 설정했는지 확인해주세요."
+        "로컬 실행 시에는 프로젝트 폴더의 .env 파일에, "
+        "Streamlit Cloud 배포 시에는 앱 설정의 Secrets에 "
+        "OPENAI_API_KEY를 설정했는지 확인해주세요."
     )
     st.stop()
 
@@ -162,11 +185,9 @@ def extract_hwp_text(data):
         ole.close()
 
 
-def extract_document_text(uploaded_file):
-    """업로드 파일에서 (확장자, 텍스트)를 반환. 실패 시 DocExtractionError."""
-    name = uploaded_file.name
+def extract_text_by_ext(name, data):
+    """파일명과 바이트에서 (확장자, 텍스트)를 반환. 실패 시 DocExtractionError."""
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    data = uploaded_file.getvalue()
 
     try:
         if ext == "pdf":
@@ -200,50 +221,80 @@ def extract_document_text(uploaded_file):
 
 
 # =====================================================================
-# 사이드바 UI
+# 데이터 폴더에서 문서 목록 / 내용 불러오기
 # =====================================================================
-use_web_search = st.sidebar.checkbox("웹검색 사용하기", value=False)
-use_doc_qa = st.sidebar.checkbox("문서 기반 답변 사용하기", value=False)
+def list_documents(folder):
+    """폴더 안의 지원되는 문서 파일명을 정렬해 반환한다."""
+    if not os.path.isdir(folder):
+        return []
+    return sorted(
+        f for f in os.listdir(folder)
+        if f.lower().endswith((".pdf", ".docx", ".hwp", ".hwpx"))
+    )
+
+
+@st.cache_data(show_spinner=False)
+def load_document_text(path):
+    """데이터 폴더의 문서 파일을 읽어 (확장자, 텍스트)를 반환한다.
+
+    같은 파일은 캐시되어 질문할 때마다 다시 읽지 않는다.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    return extract_text_by_ext(os.path.basename(path), data)
+
+
+# =====================================================================
+# 사이드바 UI - 답변 방식 선택
+# =====================================================================
+st.sidebar.subheader("답변 방식")
+answer_mode = st.sidebar.radio(
+    "어떤 방식으로 답변할까요?",
+    ["문서 기반 답변", "웹 검색 답변"],
+    label_visibility="collapsed",
+)
 st.sidebar.caption(
-    "‘문서 기반 답변’을 켜고 파일을 업로드하면, 업로드한 문서 내용을 참고해 답변합니다."
+    "기본은 데이터 폴더의 보고서를 근거로 답변합니다. "
+    "필요할 때만 ‘웹 검색 답변’을 사용해주세요."
+)
+use_web_search = answer_mode == "웹 검색 답변"
+
+
+# =====================================================================
+# 본문 상단 - 문서 선택 (문서 기반 답변일 때만)
+# =====================================================================
+st.caption(
+    "데이터 폴더의 환경 정책 보고서를 선택하고, "
+    "그 내용에 대해 질문하면 문서를 근거로 답변합니다."
 )
 
-uploaded_file = st.sidebar.file_uploader(
-    "문서 업로드 (PDF, DOCX, HWP, HWPX)",
-    type=["pdf", "docx", "hwp", "hwpx"],
-)
-
-# 업로드된 문서에서 텍스트 추출 (같은 파일은 한 번만 처리하도록 캐시)
 doc_text = None
-if uploaded_file is not None:
-    cache_key = (uploaded_file.name, uploaded_file.size)
-    if st.session_state.get("doc_cache_key") != cache_key:
-        try:
-            ext, text = extract_document_text(uploaded_file)
-            st.session_state["doc_cache_key"] = cache_key
-            st.session_state["doc_text"] = text
-            st.session_state["doc_ext"] = ext
-            st.session_state["doc_name"] = uploaded_file.name
-            st.session_state["doc_error"] = None
-        except DocExtractionError as e:
-            st.session_state["doc_cache_key"] = cache_key
-            st.session_state["doc_text"] = None
-            st.session_state["doc_error"] = str(e)
+doc_name = None
+if not use_web_search:
+    col1, col2 = st.columns([1, 2])
+    category_label = col1.selectbox("분야 선택", list(CATEGORIES.keys()))
+    folder = os.path.join(DATA_DIR, CATEGORIES[category_label])
 
-    if st.session_state.get("doc_error"):
-        st.sidebar.error(st.session_state["doc_error"])
-    elif st.session_state.get("doc_text") is not None:
-        doc_text = st.session_state["doc_text"]
-        st.sidebar.success("문서 업로드 완료")
-        st.sidebar.markdown(
-            f"- **파일명**: {st.session_state['doc_name']}\n"
-            f"- **형식**: {st.session_state['doc_ext'].upper()}\n"
-            f"- **추출된 텍스트 길이**: {len(doc_text):,}자"
+    files = list_documents(folder)
+    if not files:
+        st.warning(
+            f"문서 폴더에서 파일을 찾지 못했습니다.\n\n경로: {folder}"
         )
-        if len(doc_text) > MAX_DOC_CHARS:
-            st.sidebar.caption(
-                f"문서가 길어 앞 {MAX_DOC_CHARS:,}자만 답변에 사용합니다."
+    else:
+        selected = col2.selectbox("문서 선택", files)
+        path = os.path.join(folder, selected)
+        try:
+            ext, doc_text = load_document_text(path)
+            doc_name = selected
+            note = (
+                f" (길어서 앞 {MAX_DOC_CHARS:,}자만 사용)"
+                if len(doc_text) > MAX_DOC_CHARS else ""
             )
+            st.success(f"선택한 문서: {selected}{note}")
+        except DocExtractionError as e:
+            st.error(str(e))
+
+st.divider()
 
 
 # =====================================================================
@@ -260,15 +311,6 @@ for message in st.session_state.messages:
 # =====================================================================
 # 답변 생성 함수들
 # =====================================================================
-def generate_chat_answer(messages):
-    """기존 챗봇 방식 (Chat Completions API)."""
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[{"role": m["role"], "content": m["content"]} for m in messages],
-    )
-    return response.choices[0].message.content
-
-
 def extract_citations(response):
     """Responses API 응답에서 출처(URL) 목록을 추출한다."""
     citations = []
@@ -305,25 +347,40 @@ def generate_web_search_answer(prompt):
     return answer
 
 
-def generate_doc_answer(prompt, document_text):
-    """업로드한 문서 내용만 근거로 답변을 생성한다 (단순 방식, RAG 아님).
+def generate_doc_answer(prompt, document_text, document_name):
+    """선택한 문서 내용만 근거로 정해진 형식의 답변을 생성한다 (단순 방식, RAG 아님).
 
     문서를 user 메시지 안에 넣는다. system 프롬프트에 거절 문구를 직접 넣으면
     일부 소형 모델이 항상 거절 문구만 반환하는 문제가 있어 이 방식을 사용한다.
     """
     context = document_text[:MAX_DOC_CHARS]
     user_message = (
-        "아래 [문서]를 읽고 [질문]에 답해줘. "
-        "문서에 근거가 있으면 그 내용을 바탕으로 답하고, "
-        "문서에서 찾을 수 없는 내용이면 다른 말 없이 "
-        "'업로드된 문서에서 확인하기 어렵습니다' 라고만 답해줘.\n\n"
-        f"[문서]\n{context}\n\n[질문] {prompt}"
+        "너는 환경 정책 보고서를 읽고 질문에 답하는 도우미야. "
+        "아래 [문서]만 근거로 [질문]에 답해줘. 추측하지 말고, "
+        "문서에 있는 내용만 사용해. 반드시 아래 형식을 그대로 지켜서 답해줘.\n\n"
+        "### 요약 답변\n"
+        "질문에 대한 핵심 답을 2~3문장으로 정리.\n\n"
+        "### 문서에서 확인한 근거\n"
+        "답변의 근거가 되는 문서 속 문장이나 수치를 짧게 인용. "
+        "근거를 찾지 못했으면 '해당 근거를 찾지 못했습니다'라고 적어.\n\n"
+        "### 추가로 확인할 점\n"
+        "문서만으로는 부족해 추가로 확인이 필요한 부분을 적어. 없으면 '특이사항 없음'.\n\n"
+        "단, 문서에서 질문과 관련된 내용을 전혀 찾을 수 없으면, "
+        "위 형식을 쓰지 말고 다른 말 없이 "
+        f"'{NOT_FOUND_MESSAGE}' 라고만 답해줘.\n\n"
+        f"[문서 파일명] {document_name}\n"
+        f"[문서]\n{context}\n\n"
+        f"[질문] {prompt}"
     )
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[{"role": "user", "content": user_message}],
     )
-    return response.choices[0].message.content
+    answer = response.choices[0].message.content
+    # 답변 맨 아래에 출처(파일명)를 표시한다.
+    if NOT_FOUND_MESSAGE not in answer:
+        answer = f"{answer}\n\n---\n**출처**: {document_name}"
+    return answer
 
 
 # =====================================================================
@@ -336,35 +393,19 @@ if prompt := st.chat_input("궁금한 점을 입력해주세요"):
 
     with st.chat_message("assistant"):
         try:
-            if use_doc_qa:
-                # 문서 기반 답변: 문서가 없으면 안내
-                if not doc_text:
-                    answer = "먼저 문서를 업로드해주세요."
-                    st.markdown(answer)
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": answer}
-                    )
-                else:
-                    with st.spinner("문서 내용을 확인하는 중입니다..."):
-                        answer = generate_doc_answer(prompt, doc_text)
-                    st.markdown(answer)
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": answer}
-                    )
-            elif use_web_search:
+            if use_web_search:
                 with st.spinner("웹을 검색하는 중입니다..."):
                     answer = generate_web_search_answer(prompt)
-                st.markdown(answer)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": answer}
-                )
+            elif not doc_text:
+                # 문서 기반 답변인데 선택된 문서가 없을 때 안내
+                answer = "먼저 위에서 분야와 문서를 선택해주세요."
             else:
-                with st.spinner("답변을 생성하는 중입니다..."):
-                    answer = generate_chat_answer(st.session_state.messages)
-                st.markdown(answer)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": answer}
-                )
+                with st.spinner("문서 내용을 확인하는 중입니다..."):
+                    answer = generate_doc_answer(prompt, doc_text, doc_name)
+            st.markdown(answer)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": answer}
+            )
         except Exception as e:
             st.error(
                 "답변을 생성하는 중 문제가 발생했습니다. "
